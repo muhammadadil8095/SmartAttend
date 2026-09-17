@@ -1,6 +1,6 @@
 import { db } from "../prisma/db.js";
 import bcrypt from "bcryptjs";
-import * as xlsx from "xlsx";
+// import * as xlsx from "xlsx";
 // HOD dept resolution now uses JWT claims (req.user.departmentId) set by authMiddleware
 import { parseStudentFile } from "../utils/studentFileParser.js";
 import { generatePdfTableBuffer } from "../utils/pdfGenerator.js";
