@@ -118,6 +118,8 @@ export const createStudent = async (req, res) => {
       section,
       academicYear,
     });
+   // Auto-enroll student into matching classes
+    await autoEnrollStudent(student);
 
     res.status(201).json({
       success: true,
@@ -136,6 +138,8 @@ export const createStudent = async (req, res) => {
     });
   }
 };
+
+
 
 export const getStudentDashboard = async (req, res) => {
   try {
@@ -961,3 +965,453 @@ export const getStudentAttendanceHistoryDetail = async (req, res) => {
     });
   }
 };
+
+// ─── updateStudent ──────────────────────────────────────────────────────────
+export const updateStudent = async (req, res) => {
+  try {
+    const id = Number(req.params.id || req.body.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "Student ID is required",
+      });
+    }
+
+    // Verify student exists
+    const allStudents = await db.orm.public.Student.all();
+    const student = allStudents.find((s) => s.id === id);
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        message: "Student not found",
+      });
+    }
+
+    const {
+      name,
+      email,
+      password,
+      registerNumber,
+      departmentId,
+      semester,
+      section,
+      academicYear,
+      isActive,
+    } = req.body;
+
+    // Check duplicate email (if changed)
+    if (email) {
+      const users = await db.orm.public.User.all();
+      const emailTaken = users.some(
+        (u) => u.email === email && u.id !== student.userId,
+      );
+
+      if (emailTaken) {
+        return res.status(409).json({
+          success: false,
+          message: "Email already in use by another user",
+        });
+      }
+    }
+
+    // Check duplicate registerNumber (if changed)
+    if (registerNumber) {
+      const students = await db.orm.public.Student.all();
+      const regTaken = students.some(
+        (s) => s.registerNumber === registerNumber && s.id !== id,
+      );
+
+      if (regTaken) {
+        return res.status(409).json({
+          success: false,
+          message: "Register number already in use by another student",
+        });
+      }
+    }
+
+    // Verify department exists (if changed)
+    if (departmentId) {
+      const departments = await db.orm.public.Department.all();
+      const dept = departments.find((d) => d.id === Number(departmentId));
+
+      if (!dept) {
+        return res.status(404).json({
+          success: false,
+          message: "Department not found",
+        });
+      }
+    }
+
+    // Build User update payload
+    const userUpdate = {};
+    if (name !== undefined) userUpdate.name = name;
+    if (email !== undefined) userUpdate.email = email;
+    if (isActive !== undefined) userUpdate.isActive = isActive;
+
+    if (password) {
+      userUpdate.passwordHash = await bcrypt.hash(password, 10);
+    }
+
+    if (Object.keys(userUpdate).length > 0) {
+      await db.orm.public.User.where({ id: student.userId }).update(userUpdate);
+    }
+
+    // Build Student update payload
+    const studentUpdate = {};
+    if (registerNumber !== undefined) studentUpdate.registerNumber = registerNumber;
+    if (departmentId !== undefined) studentUpdate.departmentId = Number(departmentId);
+    if (semester !== undefined) studentUpdate.semester = Number(semester);
+    if (section !== undefined) studentUpdate.section = section;
+    if (academicYear !== undefined) studentUpdate.academicYear = academicYear;
+
+    if (Object.keys(studentUpdate).length > 0) {
+      await db.orm.public.Student.where({ id }).update(studentUpdate);
+    }
+
+    // Fetch the updated records to return
+    const updatedStudent = (await db.orm.public.Student.all()).find(
+      (s) => s.id === id,
+    );
+    const updatedUser = (await db.orm.public.User.all()).find(
+      (u) => u.id === student.userId,
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Student updated successfully",
+      data: {
+        user: updatedUser,
+        student: updatedStudent,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating student:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to update student",
+    });
+  }
+};
+export const updatestudent = updateStudent;
+
+// ─── deleteStudent ──────────────────────────────────────────────────────────
+export const deleteStudent = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "Student ID is required",
+      });
+    }
+
+    // Verify student exists
+    const allStudents = await db.orm.public.Student.all();
+    const student = allStudents.find((s) => s.id === id);
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        message: "Student not found",
+      });
+    }
+
+    // Clean up dependent child records in correct order
+
+    // 1. Delete AttendanceLogs (via Attendance records)
+    const allAttendance = await db.orm.public.Attendance.all();
+    const studentAttendance = allAttendance.filter(
+      (a) => a.studentId === id,
+    );
+
+    for (const att of studentAttendance) {
+      try {
+        await db.orm.public.AttendanceLog.where({ attendanceId: att.id }).delete();
+      } catch {
+        // No logs for this attendance record - that's fine
+      }
+    }
+
+    // 2. Delete Attendance records
+    for (const att of studentAttendance) {
+      try {
+        await db.orm.public.Attendance.where({ id: att.id }).delete();
+      } catch {
+        // Already deleted or doesn't exist
+      }
+    }
+
+    // 3. Delete Enrollment records
+    const allEnrollments = await db.orm.public.Enrollment.all();
+    const studentEnrollments = allEnrollments.filter(
+      (e) => e.studentId === id,
+    );
+
+    for (const enrollment of studentEnrollments) {
+      try {
+        await db.orm.public.Enrollment.where({ id: enrollment.id }).delete();
+      } catch {
+        // Already deleted or doesn't exist
+      }
+    }
+
+    // 4. Delete StudentBatch records (if any)
+    try {
+      const allBatches = await db.orm.public.StudentBatch.all();
+      const studentBatches = allBatches.filter((sb) => sb.studentId === id);
+
+      for (const sb of studentBatches) {
+        await db.orm.public.StudentBatch.where({ id: sb.id }).delete();
+      }
+    } catch {
+      // StudentBatch table may not exist yet
+    }
+
+    // 5. Delete StudentDevice records (if any)
+    try {
+      const allDevices = await db.orm.public.StudentDevice.all();
+      const studentDevices = allDevices.filter((d) => d.studentId === id);
+
+      for (const device of studentDevices) {
+        await db.orm.public.StudentDevice.where({ id: device.id }).delete();
+      }
+    } catch {
+      // StudentDevice table may not exist
+    }
+
+    // 6. Delete the Student record
+    await db.orm.public.Student.where({ id }).delete();
+
+    // 7. Delete the associated User record
+    await db.orm.public.User.where({ id: student.userId }).delete();
+
+    res.status(200).json({
+      success: true,
+      message: "Student deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting student:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete student",
+    });
+  }
+};
+export const deletestudent = deleteStudent;
+
+// ─── createSection ──────────────────────────────────────────────────────────
+export const createSection = async (req, res) => {
+  try {
+    const {
+      section: sectionName,
+      name,
+      departmentId,
+      semester,
+      academicYear,
+      studentIds,
+    } = req.body;
+
+    const section = sectionName || name;
+
+    if (!section || !departmentId || !semester || !academicYear) {
+      return res.status(400).json({
+        success: false,
+        message: "section, departmentId, semester, and academicYear are required",
+      });
+    }
+
+    // Verify department exists
+    const departments = await db.orm.public.Department.all();
+    const dept = departments.find((d) => d.id === Number(departmentId));
+
+    if (!dept) {
+      return res.status(404).json({
+        success: false,
+        message: "Department not found",
+      });
+    }
+
+    const allStudents = await db.orm.public.Student.all();
+    const allUsers = await db.orm.public.User.all();
+    let sectionStudents = [];
+
+    if (Array.isArray(studentIds) && studentIds.length > 0) {
+      // Assign the given students to this section
+      for (const sid of studentIds) {
+        const studentId = Number(sid);
+        const student = allStudents.find((s) => s.id === studentId);
+
+        if (student) {
+          try {
+            await db.orm.public.Student.where({ id: studentId }).update({
+              section,
+              semester: Number(semester),
+              departmentId: Number(departmentId),
+              academicYear,
+            });
+          } catch {
+            // Student may already have these values
+          }
+        }
+      }
+
+      // Re-fetch to get updated records
+      const refreshedStudents = await db.orm.public.Student.all();
+      sectionStudents = refreshedStudents.filter(
+        (s) =>
+          s.section === section &&
+          s.departmentId === Number(departmentId) &&
+          s.semester === Number(semester) &&
+          s.academicYear === academicYear,
+      );
+    } else {
+      // List existing students in this section
+      sectionStudents = allStudents.filter(
+        (s) =>
+          s.section === section &&
+          s.departmentId === Number(departmentId) &&
+          s.semester === Number(semester) &&
+          s.academicYear === academicYear,
+      );
+    }
+
+    // Enrich with user info
+    const enriched = sectionStudents.map((s) => {
+      const user = allUsers.find((u) => u.id === s.userId);
+      return {
+        id: s.id,
+        registerNumber: s.registerNumber,
+        name: user?.name ?? "",
+        email: user?.email ?? "",
+        semester: s.semester,
+        section: s.section,
+        academicYear: s.academicYear,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      message: Array.isArray(studentIds) && studentIds.length > 0
+        ? "Students assigned to section successfully"
+        : "Section students retrieved",
+      data: {
+        section,
+        departmentId: Number(departmentId),
+        departmentName: dept.name,
+        semester: Number(semester),
+        academicYear,
+        students: enriched,
+        count: enriched.length,
+      },
+    });
+  } catch (error) {
+    console.error("Error in createSection:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create/retrieve section",
+    });
+  }
+};
+export const createsection = createSection;
+
+// ─── createLabBatch ─────────────────────────────────────────────────────────
+export const createLabBatch = async (req, res) => {
+  try {
+    const {
+      batchName,
+      section,
+      departmentId,
+      semester,
+      academicYear,
+      studentIds,
+      rollNumbers,
+    } = req.body;
+
+    if (!batchName || !section || !departmentId || !semester || !academicYear) {
+      return res.status(400).json({
+        success: false,
+        message: "batchName, section, departmentId, semester, and academicYear are required",
+      });
+    }
+
+    // Verify department exists
+    const departments = await db.orm.public.Department.all();
+    const dept = departments.find((d) => d.id === Number(departmentId));
+
+    if (!dept) {
+      return res.status(404).json({
+        success: false,
+        message: "Department not found",
+      });
+    }
+
+    // Get all students in the target section
+    const allStudents = await db.orm.public.Student.all();
+    const sectionStudents = allStudents.filter(
+      (s) =>
+        s.section === section &&
+        s.departmentId === Number(departmentId) &&
+        s.semester === Number(semester) &&
+        s.academicYear === academicYear,
+    );
+
+    // Filter by studentIds, rollNumbers, or use all section students
+    let batchStudents;
+
+    if (Array.isArray(studentIds) && studentIds.length > 0) {
+      const idSet = new Set(studentIds.map(Number));
+      batchStudents = sectionStudents.filter((s) => idSet.has(s.id));
+    } else if (Array.isArray(rollNumbers) && rollNumbers.length > 0) {
+      const rollSet = new Set(rollNumbers.map(String));
+      batchStudents = sectionStudents.filter((s) =>
+        rollSet.has(s.registerNumber),
+      );
+    } else {
+      batchStudents = sectionStudents;
+    }
+
+    // Enrich with user info
+    const allUsers = await db.orm.public.User.all();
+    const enriched = batchStudents.map((s) => {
+      const user = allUsers.find((u) => u.id === s.userId);
+      return {
+        id: s.id,
+        registerNumber: s.registerNumber,
+        name: user?.name ?? "",
+        email: user?.email ?? "",
+        semester: s.semester,
+        section: s.section,
+        academicYear: s.academicYear,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Lab batch created successfully",
+      data: {
+        batchName,
+        section,
+        departmentId: Number(departmentId),
+        departmentName: dept.name,
+        semester: Number(semester),
+        academicYear,
+        students: enriched,
+        count: enriched.length,
+      },
+    });
+  } catch (error) {
+    console.error("Error in createLabBatch:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create lab batch",
+    });
+  }
+};
+export const createlabbatch = createLabBatch;
