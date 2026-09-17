@@ -120,6 +120,267 @@ export const getAdminDashboard = async (req, res) => {
   }
 };
 
+
+// Helper to resolve department from numeric ID or string code/name
+export const resolveDepartment = (departments, identifier) => {
+  if (!identifier || !departments || departments.length === 0) return null;
+  const num = Number(identifier);
+  if (!isNaN(num) && num > 0) {
+    const byId = departments.find((d) => d.id === num);
+    if (byId) return byId;
+  }
+  const str = String(identifier).trim().toUpperCase();
+  return (
+    departments.find(
+      (d) =>
+        String(d.code || "").toUpperCase() === str ||
+        String(d.name || "").toUpperCase() === str ||
+        String(d.id) === str
+    ) || null
+  );
+};
+
+// Helper for validating USN range specification
+export function parseAndValidateUsnRange(from, to) {
+  const sFrom = String(from || "").trim().toUpperCase();
+  const sTo = String(to || "").trim().toUpperCase();
+
+  if (!sFrom || !sTo) {
+    return { valid: false, error: "Both Beginning USN and Ending USN are required" };
+  }
+
+  // Case 1: Purely numeric (e.g. 1 to 23)
+  const isFromNum = /^\d+$/.test(sFrom);
+  const isToNum = /^\d+$/.test(sTo);
+
+  if (isFromNum && isToNum) {
+    const fromVal = parseInt(sFrom, 10);
+    const toVal = parseInt(sTo, 10);
+    if (fromVal > toVal) {
+      return { valid: false, error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})` };
+    }
+    return { valid: true, isNumericOnly: true, fromVal, toVal, sFrom, sTo };
+  }
+
+  // Case 2: Alphanumeric prefix + numeric suffix (e.g. 2VD23CS001 to 2VD23CS023)
+  const fromMatch = sFrom.match(/^(.*?)(\d+)$/);
+  const toMatch = sTo.match(/^(.*?)(\d+)$/);
+
+  if (fromMatch && toMatch) {
+    const fromPrefix = fromMatch[1];
+    const fromNum = parseInt(fromMatch[2], 10);
+    const toPrefix = toMatch[1];
+    const toNum = parseInt(toMatch[2], 10);
+
+    if (fromPrefix !== toPrefix) {
+      return {
+        valid: false,
+        error: `Beginning USN prefix ("${fromPrefix}") and Ending USN prefix ("${toPrefix}") do not match`,
+      };
+    }
+
+    if (fromNum > toNum) {
+      return {
+        valid: false,
+        error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})`,
+      };
+    }
+
+    return {
+      valid: true,
+      prefix: fromPrefix,
+      fromNum,
+      toNum,
+      sFrom,
+      sTo,
+    };
+  }
+
+  // Case 3: Lexicographical comparison
+  if (sFrom > sTo) {
+    return {
+      valid: false,
+      error: `Beginning USN (${sFrom}) cannot be greater than Ending USN (${sTo})`,
+    };
+  }
+
+  return { valid: true, isLexical: true, sFrom, sTo };
+}
+
+// Helper for USN range matching
+export function checkUsnRange(usn, from, to) {
+  if (!from && !to) return true;
+  const sUsn = String(usn || "").trim().toUpperCase();
+  const rangeSpec = parseAndValidateUsnRange(from, to);
+  if (!rangeSpec.valid) return false;
+
+  if (rangeSpec.prefix !== undefined) {
+    const match = sUsn.match(/^(.*?)(\d+)$/);
+    if (!match) return false;
+    const prefix = match[1];
+    const num = parseInt(match[2], 10);
+    return prefix === rangeSpec.prefix && num >= rangeSpec.fromNum && num <= rangeSpec.toNum;
+  }
+
+  if (rangeSpec.isNumericOnly) {
+    const match = sUsn.match(/(\d+)$/);
+    if (!match) return false;
+    const num = parseInt(match[1], 10);
+    return num >= rangeSpec.fromVal && num <= rangeSpec.toVal;
+  }
+
+  return sUsn >= rangeSpec.sFrom && sUsn <= rangeSpec.sTo;
+}
+
+// Helper for numeric-aware USN sorting (LOW -> HIGH)
+export function compareUsn(a, b) {
+  const sA = String(a || "").trim().toUpperCase();
+  const sB = String(b || "").trim().toUpperCase();
+  if (!sA && !sB) return 0;
+  if (!sA) return 1;
+  if (!sB) return -1;
+
+  const matchA = sA.match(/^(.*?)(\d+)$/);
+  const matchB = sB.match(/^(.*?)(\d+)$/);
+
+  if (matchA && matchB) {
+    const prefixA = matchA[1];
+    const prefixB = matchB[1];
+    if (prefixA === prefixB) {
+      const numA = parseInt(matchA[2], 10);
+      const numB = parseInt(matchB[2], 10);
+      if (numA !== numB) return numA - numB;
+    }
+  }
+
+  return sA.localeCompare(sB, undefined, { numeric: true, sensitivity: "base" });
+}
+
+
+const FACULTY_DEPARTMENT_NAMES = {
+  CSE: "Computer Science and Engineering",
+  AIML: "Artificial Intelligence and Machine Learning",
+  ECE: "Electronics and Communication",
+  EEE: "Electrical and Electronics Engineering",
+  MECH: "Mechanical Engineering",
+  CIVIL: "Civil Engineering",
+  "CSE-DS": "Computer Science and Engineering (Data Science)",
+};
+
+const ensureFacultyDepartment = async (departments, value) => {
+  const existing = resolveDepartment(departments, value);
+  if (existing) return existing;
+
+  const code = String(value || "").trim().toUpperCase();
+  if (!code) return null;
+
+  const name = FACULTY_DEPARTMENT_NAMES[code] || String(value).trim();
+  if (!name) return null;
+
+  return db.orm.public.Department.create({ name, code });
+};
+
+// Helper to check if a department matches HOD's department scope
+export const isDepartmentMatch = (dept, hodDepartmentId) => {
+  if (!hodDepartmentId) return true;
+  if (!dept) return false;
+  const num = Number(hodDepartmentId);
+  if (!isNaN(num) && num > 0) {
+    return dept.id === num;
+  }
+  const str = String(hodDepartmentId).trim().toUpperCase();
+  return (
+    String(dept.code || "").toUpperCase() === str ||
+    String(dept.name || "").toUpperCase() === str ||
+    String(dept.id) === str
+  );
+};
+
+// Helper to match student department code/name/id
+export const matchDepartment = (student, targetCode, departments = []) => {
+  if (!targetCode) return true;
+
+  const numericTarget = Number(targetCode);
+  if (!isNaN(numericTarget) && numericTarget > 0 && student.departmentId) {
+    if (student.departmentId === numericTarget) return true;
+  }
+
+  const target = String(targetCode).trim().toUpperCase();
+
+  // 1. Check against departments table if departmentId exists
+  if (student.departmentId && departments.length > 0) {
+    const dept = departments.find((d) => d.id === student.departmentId);
+    if (dept) {
+      if (String(dept.id) === target) return true;
+      const code = String(dept.code || "").toUpperCase();
+      if (code === target) return true;
+      const name = String(dept.name || "").toUpperCase();
+      if (name === target) return true;
+    }
+  }
+
+  // 2. Exact code match on student.departmentCode
+  const sDeptCode = String(student.departmentCode || "").trim().toUpperCase();
+  if (sDeptCode) {
+    if (sDeptCode === target) return true;
+  }
+
+  // 3. Department name matching with strict keywords (avoid substring collisions like 'EE' in 'Engineering')
+  const sDept = String(student.department || "").toUpperCase();
+
+  if (target === "CSE-DS") {
+    return sDept.includes("DATA SCIENCE") || sDept.includes("CSE-DS") || sDept.includes("CSE (DS)");
+  }
+
+  if (target === "CSE") {
+    return (sDept.includes("COMPUTER SCIENCE") || sDept === "CSE") && !sDept.includes("DATA SCIENCE");
+  }
+
+  if (target === "AIML") {
+    return sDept.includes("ARTIFICIAL INTELLIGENCE") || sDept.includes("AIML") || sDept.includes("AI & ML") || sDept.includes("AI/ML");
+  }
+
+  if (target === "ECE") {
+    return sDept.includes("ELECTRONICS") || sDept === "ECE";
+  }
+
+  if (target === "EEE") {
+    return sDept.includes("ELECTRICAL") || sDept === "EEE";
+  }
+
+  if (target === "MECH") {
+    return sDept.includes("MECHANICAL") || sDept === "MECH";
+  }
+
+  if (target === "CIVIL") {
+    return sDept.includes("CIVIL");
+  }
+
+  return sDept === target;
+};
+
+// Seed/demo fallback dataset covering all departments
+const FALLBACK_STUDENTS = [
+  { id: 101, name: "Rahul Sharma", usn: "01CS123", department: "Computer Science & Engineering", departmentCode: "CSE", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "rahul.sharma@klsvdit.edu.in", deviceBound: true, boundDeviceName: "Pixel 8" },
+  { id: 102, name: "Ananya Singh", usn: "01CS124", department: "Computer Science & Engineering", departmentCode: "CSE", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "ananya.singh@klsvdit.edu.in", deviceBound: true, boundDeviceName: "iPhone 15" },
+  { id: 103, name: "Vikram Patel", usn: "01CS125", department: "Computer Science & Engineering", departmentCode: "CSE", semester: 5, section: "B", Lab: "B1", lab: "B1", academicYear: "2026-27", email: "vikram.patel@klsvdit.edu.in", deviceBound: true, boundDeviceName: "Galaxy S23" },
+  { id: 104, name: "Arjun Kumar", usn: "01CS127", department: "Computer Science & Engineering", departmentCode: "CSE", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "arjun.kumar@klsvdit.edu.in", deviceBound: true, boundDeviceName: "OnePlus 11" },
+  { id: 201, name: "Priya Sharma", usn: "01AI001", department: "Artificial Intelligence & Machine Learning", departmentCode: "AIML", semester: 3, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "priya.sharma@klsvdit.edu.in", deviceBound: true, boundDeviceName: "iPhone 14" },
+  { id: 202, name: "Rohit Gupta", usn: "01AI002", department: "Artificial Intelligence & Machine Learning", departmentCode: "AIML", semester: 3, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "rohit.gupta@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
+  { id: 301, name: "Ishita Rao", usn: "01EC203", department: "Electronics & Communication", departmentCode: "ECE", semester: 3, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "ishita.rao@klsvdit.edu.in", deviceBound: true, boundDeviceName: "iPhone 14" },
+  { id: 302, name: "Manoj Kumar", usn: "01EC204", department: "Electronics & Communication", departmentCode: "ECE", semester: 3, section: "B", Lab: "B1", lab: "B1", academicYear: "2026-27", email: "manoj.kumar@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
+  { id: 401, name: "Suresh Patil", usn: "01EE101", department: "Electrical & Electronics Engineering", departmentCode: "EEE", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "suresh.patil@klsvdit.edu.in", deviceBound: true, boundDeviceName: "Galaxy A54" },
+  { id: 402, name: "Divya K", usn: "01EE102", department: "Electrical & Electronics Engineering", departmentCode: "EEE", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "divya.k@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
+  { id: 501, name: "Adarsh Joshi", usn: "01ME051", department: "Mechanical Engineering", departmentCode: "MECH", semester: 7, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "adarsh.joshi@klsvdit.edu.in", deviceBound: true, boundDeviceName: "Vivo X90" },
+  { id: 502, name: "Ramesh Patil", usn: "01ME052", department: "Mechanical Engineering", departmentCode: "MECH", semester: 7, section: "B", Lab: "B1", lab: "B1", academicYear: "2026-27", email: "ramesh.patil@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
+  { id: 601, name: "Sneha Kulkarni", usn: "01CV011", department: "Civil Engineering", departmentCode: "CIVIL", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "sneha.kulkarni@klsvdit.edu.in", deviceBound: true, boundDeviceName: "Pixel 7a" },
+  { id: 602, name: "Vijay Kumar", usn: "01CV012", department: "Civil Engineering", departmentCode: "CIVIL", semester: 5, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "vijay.kumar@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
+  { id: 701, name: "Pooja Nair", usn: "01DS001", department: "Computer Science (Data Science)", departmentCode: "CSE-DS", semester: 3, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "pooja.nair@klsvdit.edu.in", deviceBound: true, boundDeviceName: "iPhone 13" },
+  { id: 702, name: "Karthik Hegde", usn: "01DS002", department: "Computer Science (Data Science)", departmentCode: "CSE-DS", semester: 3, section: "A", Lab: "A1", lab: "A1", academicYear: "2026-27", email: "karthik.hegde@klsvdit.edu.in", deviceBound: false, boundDeviceName: null },
+];
+
+// H
+
 export const getAdminStudents = async (req, res) => {
  try {
     // HOD dept resolved from JWT claim (DB-authoritative, set by authMiddleware)
